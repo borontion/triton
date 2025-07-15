@@ -329,13 +329,16 @@ struct DotOpMFMAConversionHelper {
             Value acc = tb.undef(vecTy);
 
             for (int v = 0; v < elemsPerVec; ++v) {
-              Value c = fc[linearize({b, m, n, v}, fcStrides)];
+              int linearIdx = linearize({b, m, n, v}, fcStrides);
+              Value c = fc[linearIdx];
+
               if (subBlocks > 1) {
                 Value cond = tb.icmp_eq(
                     tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
                     tb.i32_val(g));
                 c = tb.select(cond, c, zero);
               }
+
               acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
             }
 
@@ -355,8 +358,38 @@ struct DotOpMFMAConversionHelper {
             }
 
             acc = reduceSubBlocks(subBlocks, acc);
-            adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
+
+            for (int v = 0; v < elemsPerVec; ++v) {
+              int linearIdx = linearize({b, m, n, v}, fcStrides);
+
+              Value c = fc[linearIdx];
+              Value accElem = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
+              if (kDimInstrSize > kDimOperandSize) {
+                assert(kDimInstrSize % kDimOperandSize == 0);
+                int duplicationRate = kDimInstrSize / kDimOperandSize;
+                assert(llvm::isPowerOf2_32(duplicationRate));
+                if (dstElemTy.isInteger()) {
+                  auto shiftSize = llvm::Log2_32(duplicationRate);
+                  assert(!accElem.getType().isUnsignedInteger() &&
+                         "MFMA uses signed accumulator");
+                  accElem = tb.ashr(accElem, tb.i32_val(shiftSize));
+                } else {
+                  auto multiplierAttr =
+                      rewriter.getFloatAttr(dstElemTy, 1.0 / duplicationRate);
+                  auto multiplierVal = rewriter.create<LLVM::ConstantOp>(
+                      loc, dstElemTy, multiplierAttr);
+                  accElem = tb.fmul(accElem, multiplierVal);
+                }
+              }
+
+              if (subBlocks > 1) {
+                Value cond = tb.icmp_eq(
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
+                    tb.i32_val(g));
+                accElem = tb.select(cond, accElem, c);
+              }
+              fc[linearIdx] = accElem;
+            }
           }
         }
       }
