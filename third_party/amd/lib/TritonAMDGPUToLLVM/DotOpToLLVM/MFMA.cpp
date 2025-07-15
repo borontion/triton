@@ -89,25 +89,9 @@ struct DotOpMFMAConversionHelper {
   }
 
   int getNumSubmatrices(Type elementType, int mDim, int nDim) const {
-    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
-      return 1;
-    assert(mDim == nDim);
-    switch (mDim) {
-    case 32:
-    case 16:
-      return 1;
-      break;
-    case 4:
-      assert(elementType.getIntOrFloatBitWidth() <= 32 &&
-             "fp64 is not supported yet");
-      assert(elementType.getIntOrFloatBitWidth() != 8 ||
-             elementType.isInteger(8) && "fp8 is not supported yet");
+    if (mDim == 4 || nDim == 4)
       return 16;
-      break;
-    default:
-      llvm::report_fatal_error("unsupported nonKDim in MFMA dot");
-    }
-    return -1;
+    return 1;
   }
 
   Value processSubBlocks(int numSubBlocks, Value acc, bool reduceSubBlocks,
@@ -307,51 +291,73 @@ struct DotOpMFMAConversionHelper {
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
+    int numTileGroups = 1;
+    int tileGroupSize = -1;
+    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
+      numTileGroups = 16;
+      tileGroupSize = 4;
+    }
+
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepK, kWidth, kBase,
+        loadedA, numRepB, numRepM * numTileGroups, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepK, kWidth, kBase,
+        loadedB, numRepB, numRepN * numTileGroups, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
+
+    int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
+    int elemsPerVec = mDim * nDim / warpSize;
+    int numVecInKBase = numRepK * kWidth / kBase;
+
+    const int subBlocks =
+        getNumSubmatrices(aTensorTy.getElementType(), mDim, nDim);
 
     auto dstElemTy = dTensorTy.getElementType();
     auto fc = unpackLLElements(loc, loadedC, rewriter);
-
-    unsigned warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
-    // compute number of output elements that each thread holds for one MFMA
-    // instruction.
-    const int subBlocks =
-        getNumSubmatrices(aTensorTy.getElementType(), mDim, nDim);
-    auto elemsPerVec = mDim * nDim * subBlocks / warpSize;
-    int numVecInKBase = numRepK * kWidth / kBase;
+    SmallVector<int64_t> fcStrides =
+        computeStrides({numRepB, numRepM, numRepN, elemsPerVec});
 
     Value firstMfma;
+    Value laneId = getLaneId(rewriter, loc);
+    Value zero = dstElemTy.isInteger(32) ? tb.i32_val(0) : tb.f32_val(0.0);
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
     for (int b = 0; b < numRepB; ++b) {
       for (int m = 0; m < numRepM; ++m) {
         for (int n = 0; n < numRepN; ++n) {
-          Value acc = tb.undef(vecTy);
-          for (unsigned v = 0; v < elemsPerVec; ++v) {
-            acc = tb.insert_element(
-                vecTy, acc,
-                fc[b * numRepM * numRepN * elemsPerVec +
-                   m * numRepN * elemsPerVec + n * elemsPerVec + v],
-                tb.i32_val(v));
+          for (int g = 0; g < numTileGroups; ++g) {
+            Value acc = tb.undef(vecTy);
+
+            for (int v = 0; v < elemsPerVec; ++v) {
+              Value c = fc[linearize({b, m, n, v}, fcStrides)];
+              if (subBlocks > 1) {
+                Value cond = tb.icmp_eq(
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
+                    tb.i32_val(g));
+                c = tb.select(cond, c, zero);
+              }
+              acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
+            }
+
+            for (int k = 0; k < numVecInKBase; ++k) {
+              acc =
+                  mfmaLayout.getIsTransposed()
+                      ? generateMFMAOp(intrinsicName,
+                                       operandB[{b, n * numTileGroups + g, k}],
+                                       operandA[{b, m * numTileGroups + g, k}],
+                                       acc)
+                      : generateMFMAOp(intrinsicName,
+                                       operandA[{b, m * numTileGroups + g, k}],
+                                       operandB[{b, n * numTileGroups + g, k}],
+                                       acc);
+              if (!firstMfma)
+                firstMfma = acc;
+            }
+
+            acc = reduceSubBlocks(subBlocks, acc);
+            adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
+                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
           }
-          acc = zeroAuxiliarBlocks(subBlocks, acc);
-          for (int k = 0; k < numVecInKBase; k++) {
-            acc = mfmaLayout.getIsTransposed()
-                      ? generateMFMAOp(intrinsicName, operandB[{b, n, k}],
-                                       operandA[{b, m, k}], acc)
-                      : generateMFMAOp(intrinsicName, operandA[{b, m, k}],
-                                       operandB[{b, n, k}], acc);
-            if (!firstMfma)
-              firstMfma = acc;
-          }
-          acc = reduceSubBlocks(subBlocks, acc);
-          adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                kDimInstrSize, kDimOperandSize, elemsPerVec);
         }
       }
     }
@@ -366,7 +372,7 @@ struct DotOpMFMAConversionHelper {
       setPrioOp->moveAfter(firstMfma.getDefiningOp());
 
     const size_t mmaCount =
-        numRepB * numRepM * numRepN * numRepK * kWidth / kBase;
+        numRepB * numRepM * numRepN * numTileGroups * numVecInKBase;
     packAndReplaceResult(op, fc, maybeMfmaIntrinsic, dstElemTy, elemTyA,
                          mmaCount);
 
@@ -446,8 +452,9 @@ struct DotOpMFMAConversionHelper {
     int numVecInKBase = kRepInKWidth * kWidth / kBase;
     ValueTable dotOpVals;
 
-    SmallVector<int64_t> bounds = {batch, nonKRep, numVecInKBase, kBase};
-    SmallVector<int64_t> strides = computeStrides(bounds);
+    int duplicates = batch * nonKRep * numVecInKBase * kBase / elems.size();
+    SmallVector<int64_t> strides =
+        computeStrides({batch, nonKRep / duplicates, numVecInKBase, kBase});
     for (int b = 0; b < batch; ++b) {
       for (int nonK = 0; nonK < nonKRep; nonK++) {
         for (int kBaseVec = 0; kBaseVec < numVecInKBase; kBaseVec++) {
@@ -460,7 +467,8 @@ struct DotOpMFMAConversionHelper {
           Type ty = vec_ty(elemTy, kBase);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kBase; ++k) {
-            auto index = linearize({b, nonK, kBaseVec, k}, strides);
+            auto index =
+                linearize({b, nonK / duplicates, kBaseVec, k}, strides);
             rawElems =
                 tb.insert_element(ty, rawElems, elems[index], tb.i32_val(k));
           }

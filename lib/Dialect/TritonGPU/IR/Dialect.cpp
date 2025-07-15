@@ -1385,9 +1385,12 @@ LogicalResult AMDMfmaEncodingAttr::verify(
   if (!(version >= 0 && version <= 4)) {
     return emitError() << "version must be in the [0, 4] range";
   }
-  if (!((mDim == 32 && nDim == 32) || (mDim == 16 && nDim == 16))) {
-    return emitError()
-           << "(M, N) cases other than (32, 32) or (16, 16) unimplemented";
+
+  if (!((mDim == 32 && nDim == 32) || (mDim == 16 && nDim == 16) ||
+        (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64) ||
+        (mDim == 4 && nDim == 4))) {
+    return emitError() << "invalid (mDim, nDim) combination: (" << mDim << ", "
+                       << nDim << ")";
   }
 
   return success();
@@ -1884,7 +1887,7 @@ AMDMfmaEncodingAttr::getInstrShapeForOperand(int kWidth, int opIdx) const {
   if (mDim == nDim)
     kGroups = warpSize / mDim;
   if (mDim == 64 && nDim == 4 || mDim == 4 && nDim == 64)
-    kGroups = 1;
+    kGroups = warpSize / 4;
   int64_t kDim = kWidth * kGroups;
   if (opIdx == 0)
     return {mDim, kDim};
