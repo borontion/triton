@@ -1298,32 +1298,35 @@ public:
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
-    RewritePatternSet patterns(context);
+    RewritePatternSet mfmaPatterns(context);
     switch (auto isaFamily = triton::AMD::deduceISAFamily(archGenerationName)) {
     case ISAFamily::CDNA4:
-      patterns.add<::ScaledBlockedToScaledMFMAF8F6F4>(
+      mfmaPatterns.add<::ScaledBlockedToScaledMFMAF8F6F4>(
           context, getMfmaVersion(isaFamily), matrixInstructionSize,
           /*benefit=*/10);
       [[fallthrough]];
     case ISAFamily::CDNA1:
     case ISAFamily::CDNA2:
     case ISAFamily::CDNA3:
-      patterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
+      mfmaPatterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
           context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
           /*benefit=*/2);
       break;
     case ISAFamily::RDNA3:
-      patterns.add<::BlockedToWMMA>(context, getWmmaVersion(archGenerationName),
-                                    matrixInstructionSize,
-                                    /*benefit=*/2);
+      mfmaPatterns.add<::BlockedToWMMA>(
+          context, getWmmaVersion(archGenerationName), matrixInstructionSize,
+          /*benefit=*/2);
       break;
     default:
       break;
     }
-    patterns.add<AccelerateBlocked>(context, archGenerationName, /*benefit=*/1);
-    if (applyPatternsGreedily(m, std::move(patterns)).failed()) {
+    if (applyPatternsGreedily(m, std::move(mfmaPatterns)).failed())
       signalPassFailure();
-    }
+
+    RewritePatternSet patterns(context);
+    patterns.add<AccelerateBlocked>(context, archGenerationName, /*benefit=*/1);
+    if (applyPatternsGreedily(m, std::move(patterns)).failed())
+      signalPassFailure();
     decomposeMixedModeDotOp(m);
   }
 };
