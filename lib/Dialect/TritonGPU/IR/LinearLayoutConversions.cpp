@@ -428,6 +428,8 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
     registerBase = {{0, 1}, {0, 2}};
     laneBase = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}};
   } else if (MDim == 4 && NDim == 4) {
+    // TODO(pengzhan): This layout may cause some issue as there are multiple
+    // lanes holding the same element
     registerBase = {{0, 1}, {0, 2}};
     laneBase = {{1, 0}, {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   }
@@ -660,7 +662,8 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
     assert(NDim == 16);
     laneBase = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {kWidth, 0}, {kWidth * 2, 0}};
     kTileSize = 4 * kWidth;
-  } else if (MDim == 4 || NDim == 4) {
+  } else if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64) ||
+             (MDim == 4 && NDim == 4)) {
     laneBase = {{0, 1},          {0, 2},          {kWidth, 0},
                 {kWidth * 2, 0}, {kWidth * 4, 0}, {kWidth * 8, 0}};
     kTileSize = 16 * kWidth;
