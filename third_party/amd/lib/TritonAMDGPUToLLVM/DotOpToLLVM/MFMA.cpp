@@ -308,6 +308,8 @@ struct DotOpMFMAConversionHelper {
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
     int elemsPerVec = mDim * nDim / warpSize;
+    if (mDim == 4 && nDim == 4)
+      elemsPerVec = 4;
     int numVecInKBase = numRepK * kWidth / kBase;
 
     const int subBlocks =
