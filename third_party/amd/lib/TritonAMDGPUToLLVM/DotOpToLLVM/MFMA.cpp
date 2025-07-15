@@ -363,32 +363,15 @@ struct DotOpMFMAConversionHelper {
               int linearIdx = linearize({b, m, n, v}, fcStrides);
 
               Value c = fc[linearIdx];
-              Value accElem = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
-              if (kDimInstrSize > kDimOperandSize) {
-                assert(kDimInstrSize % kDimOperandSize == 0);
-                int duplicationRate = kDimInstrSize / kDimOperandSize;
-                assert(llvm::isPowerOf2_32(duplicationRate));
-                if (dstElemTy.isInteger()) {
-                  auto shiftSize = llvm::Log2_32(duplicationRate);
-                  assert(!accElem.getType().isUnsignedInteger() &&
-                         "MFMA uses signed accumulator");
-                  accElem = tb.ashr(accElem, tb.i32_val(shiftSize));
-                } else {
-                  auto multiplierAttr =
-                      rewriter.getFloatAttr(dstElemTy, 1.0 / duplicationRate);
-                  auto multiplierVal = rewriter.create<LLVM::ConstantOp>(
-                      loc, dstElemTy, multiplierAttr);
-                  accElem = tb.fmul(accElem, multiplierVal);
-                }
-              }
+              Value elem = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
 
               if (subBlocks > 1) {
                 Value cond = tb.icmp_eq(
                     tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
                     tb.i32_val(g));
-                accElem = tb.select(cond, accElem, c);
+                elem = tb.select(cond, elem, c);
               }
-              fc[linearIdx] = accElem;
+              fc[linearIdx] = elem;
             }
           }
         }
