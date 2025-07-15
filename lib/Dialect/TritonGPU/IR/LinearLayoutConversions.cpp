@@ -432,7 +432,6 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
     laneBase = {{1, 0}, {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   }
 
-  assert(!registerBase.empty() && !laneBase.empty());
   LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
                           {outDimNames[order[0]], outDimNames[order[1]]});
   if (getIsTransposed())
@@ -653,7 +652,6 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   int32_t kTileSize = -1;
   auto MDim = mfmaLayout.getMDim();
   auto NDim = mfmaLayout.getNDim();
-  auto opIdx = dotMfmaLayout.getOpIdx();
   if (MDim == 32) {
     assert(NDim == 32);
     laneBase = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {kWidth, 0}};
@@ -672,7 +670,6 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   for (int32_t elem = kTileSize; elem < kSize; elem *= 2)
     registerBase.emplace_back(std::vector<int32_t>{elem, 0});
 
-  assert(!laneBase.empty() && !registerBase.empty());
   // Base vectors above are defined in a fixed order [k-dim, non-k-dim].
   // To assign them to actual matrix dimensions we assoicate with register
   // `order` which is also also [k, nonk].
