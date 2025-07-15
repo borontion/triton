@@ -429,7 +429,7 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
     laneBase = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}};
   } else if (MDim == 4 && NDim == 4) {
     registerBase = {{0, 1}, {0, 2}};
-    laneBase = {{1, 0}, {2, 0}, {1, 0}, {2, 0}, {1, 0}, {2, 0}};
+    laneBase = {{1, 0}, {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
   }
 
   assert(!registerBase.empty() && !laneBase.empty());
