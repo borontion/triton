@@ -409,21 +409,23 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // vector is a tuple of values mapping to matrix C's (N, M[, B]) indices,
   // which will be [1, 0] / [2, 1, 0].
   SmallVector<unsigned> order = getDefaultMmaOrder(*this);
-  auto NDimName = outDimNames[order[0]];
   auto MDimName = outDimNames[order[1]];
+  auto NDimName = outDimNames[order[0]];
 
   unsigned MDim = getMDim();
   unsigned NDim = getNDim();
-  // For all mfma instructions except for f64, height = 4
-  constexpr int height = 4;
+  constexpr int height = 4; // For all mfma instructions except for f64,
+                            // height = 4
   constexpr int warpSize = 64;
+
   // Each lane holds #elements = height, along the M dimension.
   LinearLayout regs = LinearLayout::identity1D(height, kRegister, MDimName);
-  // Distribute the lanes along the N dimension.
-  LinearLayout lanes = LinearLayout::identity1D(NDim, kLane, NDimName);
-  // Distribute the lanes along the M dimension. If the #elements exceeds
+
+  // First, distribute the lanes along the N dimension.
+  // Then, distribute the lanes along the M dimension. If the #elements exceeds
   // the MDim, duplicate elements across lanes - this can happen for
   // 4x4 output.
+  LinearLayout lanes = LinearLayout::identity1D(NDim, kLane, NDimName);
   if (height * warpSize / NDim <= MDim) {
     lanes *= LinearLayout::identity1D(warpSize / NDim, kLane, MDimName);
   } else {
@@ -431,11 +433,12 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
 
   LinearLayout tileLayout = (regs * lanes);
+  tileLayout = tileLayout.transposeOuts({NDimName, MDimName});
 
-  // Repeat the tile along the M dimension if there are multiple blocks.
-  int blocks = (MDim * NDim) / (warpSize * height);
-  if (blocks > 0) {
-    tileLayout *= LinearLayout::identity1D(blocks, kRegister, MDimName);
+  // Repeat the above distribution along the M dimension to fits the tile.
+  int tiles = (MDim * NDim) / (warpSize * height);
+  if (tiles > 0) {
+    tileLayout *= LinearLayout::identity1D(tiles, kRegister, MDimName);
   }
 
   if (getIsTransposed())
@@ -653,13 +656,13 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
                                        // for MDim == 4 or NDim == 4,
                                        // always use nonKDim = 4
   constexpr int warpSize = 64;
-  LinearLayout regs =
-      // One lane will hold kWidth elements along the K dimension
-      LinearLayout::identity1D(kWidth, kRegister, kDimName);
+
+  // One lane will hold kWidth elements along the K dimension
+  LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, kDimName);
+  // First distribute nonKDim elements along the non-K dimension,
+  // then distribute remaining elements along the K dimension
   LinearLayout lanes =
-      // Distribute nonKDim elements along the non-K dimension
       LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
-      // Distribute remaining elements along the K dimension
       LinearLayout::identity1D(warpSize / nonKDim, kLane, kDimName);
   LinearLayout tileLayout = regs * lanes;
   tileLayout = tileLayout.transposeOuts({kDimName, nonKDimName});
@@ -672,12 +675,11 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
         LinearLayout::identity1D(kSize / kTileSize, kRegister, kDimName);
   }
 
-  // Note MFMA4x4 instruction can produce 4x4 tiles. For 4x64 or 64x4 output,
-  // we need to compose 16 MFMA4x4 instructions. In the case MDim = 4, NDim = 64
-  // or MDim = 64, NDim = 4, we have one 64x64 operand,
-  // and another 64x4 or 4x64 operand:
+  // MFMA4x4 instruction will produce 4x4 tiles. For 4x64 or 64x4 output,
+  // we need to compose 16 MFMA4x4 instructions. In these cases:
   // - For the 64x64 operand, repeat the tile layout along the non-K dimension
-  // - For the 64x4 or 4x64 operand, duplicates elements in registers
+  // - For the 64x4 or 4x64 operand, duplicates elements in registers to match
+  //   the other operand
   auto opIdx = dotMfmaLayout.getOpIdx();
   if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64)) {
     if ((MDim == 64 && opIdx == 0) || (NDim == 64 && opIdx == 1)) {
