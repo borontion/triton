@@ -282,13 +282,14 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
       rewriter, loc, linearWarpId, warpsPerCTA, mfmaInstrNonK,
       shape[nonKDimIdx], nonKDimIdx, warpOrder);
 
-  // number of duplicates of elements in warp
-  // In case of 64x4 x 4x4 multiplication, 4x4 B operand is duplicated 16 times
-  int numSubBlocks = 1;
-  if ((mfmaInstrK == 4 || mfmaInstrK == 1) && mfmaInstrNonK == 4)
-    numSubBlocks = 16;
+  // For the 64x4 or 4x64 operand, duplicates elements 16 times
+  int duplicates = 1;
+  if (((mDim == 64 && nDim == 4) && opIdx == 1) ||
+      (mDim == 4 && nDim == 64) && opIdx == 0)
+    duplicates = 16;
+
   // numOfElemsPerThreadPerMfmaInstr
-  int numOfElems = mfmaInstrNonK * mfmaInstrK * numSubBlocks / iWarpSize;
+  int numOfElems = mfmaInstrNonK * mfmaInstrK * duplicates / iWarpSize;
   assert(numOfElems >= 1);
 
   unsigned int maxNumWarps = shape[nonKDimIdx] / mfmaInstrNonK;
@@ -344,13 +345,13 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
       offsets = AMD::computeOffsetsAType(
           rewriter, loc, computeTensorElemMappingInBlock, elemsPerInstr,
           spatialWarpId, lane, warpsPerBlockNonK, numOfElems, numReps, smemObj,
-          smemStrides, sharedLayout, mDim, mfmaInstrK);
+          smemStrides, sharedLayout, mDim * duplicates, mfmaInstrK);
     } else {
       assert(opIdx == 1);
       offsets = AMD::computeOffsetsBType(
           rewriter, loc, computeTensorElemMappingInBlock, elemsPerInstr,
           spatialWarpId, lane, warpsPerBlockNonK, numOfElems, numReps, smemObj,
-          smemStrides, sharedLayout, nDim, mfmaInstrK);
+          smemStrides, sharedLayout, nDim * duplicates, mfmaInstrK);
     }
     smemBase = AMD::computeBasePtr(rewriter, loc, smemObj, smemStrides);
   }

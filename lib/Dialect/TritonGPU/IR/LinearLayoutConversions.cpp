@@ -409,36 +409,36 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // vector is a tuple of values mapping to matrix C's (N, M[, B]) indices,
   // which will be [1, 0] / [2, 1, 0].
   SmallVector<unsigned> order = getDefaultMmaOrder(*this);
-  auto MDimName = outDimNames[order[1]];
-  auto NDimName = outDimNames[order[0]];
+  auto mDimName = outDimNames[order[1]];
+  auto nDimName = outDimNames[order[0]];
 
-  unsigned MDim = getMDim();
-  unsigned NDim = getNDim();
+  unsigned mDim = getMDim();
+  unsigned nDim = getNDim();
   constexpr int height = 4; // For all mfma instructions except for f64,
                             // height = 4
   constexpr int warpSize = 64;
 
   // Each lane holds #elements = height, along the M dimension.
-  LinearLayout regs = LinearLayout::identity1D(height, kRegister, MDimName);
+  LinearLayout regs = LinearLayout::identity1D(height, kRegister, mDimName);
 
   // First, distribute the lanes along the N dimension.
   // Then, distribute the lanes along the M dimension. If the #elements exceeds
-  // the MDim, duplicate elements across lanes - this can happen for
+  // the mDim, duplicate elements across lanes - this can happen for
   // 4x4 output.
-  LinearLayout lanes = LinearLayout::identity1D(NDim, kLane, NDimName);
-  if (height * warpSize / NDim <= MDim) {
-    lanes *= LinearLayout::identity1D(warpSize / NDim, kLane, MDimName);
+  LinearLayout lanes = LinearLayout::identity1D(nDim, kLane, nDimName);
+  if (height * warpSize / nDim <= mDim) {
+    lanes *= LinearLayout::identity1D(warpSize / nDim, kLane, mDimName);
   } else {
-    lanes *= LinearLayout::zeros1D(warpSize / NDim, kLane, MDimName);
+    lanes *= LinearLayout::zeros1D(warpSize / nDim, kLane, mDimName);
   }
 
   LinearLayout tileLayout = (regs * lanes);
-  tileLayout = tileLayout.transposeOuts({NDimName, MDimName});
+  tileLayout = tileLayout.transposeOuts({nDimName, mDimName});
 
   // Repeat the above distribution along the M dimension to fits the tile.
-  int tiles = (MDim * NDim) / (warpSize * height);
+  int tiles = (mDim * nDim) / (warpSize * height);
   if (tiles > 0) {
-    tileLayout *= LinearLayout::identity1D(tiles, kRegister, MDimName);
+    tileLayout *= LinearLayout::identity1D(tiles, kRegister, mDimName);
   }
 
   if (getIsTransposed())
@@ -650,11 +650,9 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   // in both cases it is [M dim, N dim]/[batch, M dim, N dim]
   auto warpOrder = getDefaultMmaOrder(mfmaLayout);
 
-  auto MDim = mfmaLayout.getMDim();
-  auto NDim = mfmaLayout.getNDim();
-  auto nonKDim = std::min(MDim, NDim); // for 32x32 and 16x16 MDim == NDim;
-                                       // for MDim == 4 or NDim == 4,
-                                       // always use nonKDim = 4
+  auto mDim = mfmaLayout.getMDim();
+  auto nDim = mfmaLayout.getNDim();
+  auto nonKDim = std::min(mDim, nDim); // for 4x64 and 64x4, nonKDim = 4
   constexpr int warpSize = 64;
 
   // One lane will hold kWidth elements along the K dimension
@@ -681,14 +679,15 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   // - For the 64x4 or 4x64 operand, duplicates elements in registers to match
   //   the other operand along the non-K dimension.
   auto opIdx = dotMfmaLayout.getOpIdx();
-  if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64)) {
-    if ((MDim == 64 && opIdx == 0) || (NDim == 64 && opIdx == 1)) {
-      tileLayout *= LinearLayout::identity1D(16, kRegister, nonKDimName);
-    }
-
-    if ((MDim == 64 && opIdx == 1) || (NDim == 64 && opIdx == 0)) {
-      tileLayout *= LinearLayout::zeros1D(16, kRegister, nonKDimName);
-    }
+  if ((mDim == 64 && nDim == 4)) {
+    tileLayout *= opIdx == 0
+                      ? LinearLayout::identity1D(16, kRegister, nonKDimName)
+                      : LinearLayout::zeros1D(16, kRegister, nonKDimName);
+  }
+  if ((mDim == 4 && nDim == 64)) {
+    tileLayout *= opIdx == 1
+                      ? LinearLayout::identity1D(16, kRegister, nonKDimName)
+                      : LinearLayout::zeros1D(16, kRegister, nonKDimName);
   }
 
   if (hasBatchDim) {
