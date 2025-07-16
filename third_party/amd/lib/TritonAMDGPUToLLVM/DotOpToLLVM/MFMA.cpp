@@ -508,9 +508,8 @@ struct DotOpMFMAConversionHelper {
     int numVecInKBase = kRepInKWidth * kWidth / kBase;
     ValueTable dotOpVals;
 
-    int duplicates = batch * nonKRep * numVecInKBase * kBase / elems.size();
     SmallVector<int64_t> strides =
-        computeStrides({batch, nonKRep / duplicates, numVecInKBase, kBase});
+        computeStrides({batch, nonKRep, numVecInKBase, kBase});
     for (int b = 0; b < batch; ++b) {
       for (int nonK = 0; nonK < nonKRep; nonK++) {
         for (int kBaseVec = 0; kBaseVec < numVecInKBase; kBaseVec++) {
@@ -523,8 +522,7 @@ struct DotOpMFMAConversionHelper {
           Type ty = vec_ty(elemTy, kBase);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kBase; ++k) {
-            auto index =
-                linearize({b, nonK / duplicates, kBaseVec, k}, strides);
+            auto index = linearize({b, nonK, kBaseVec, k}, strides);
             rawElems =
                 tb.insert_element(ty, rawElems, elems[index], tb.i32_val(k));
           }

@@ -409,31 +409,35 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   // vector is a tuple of values mapping to matrix C's (N, M[, B]) indices,
   // which will be [1, 0] / [2, 1, 0].
   SmallVector<unsigned> order = getDefaultMmaOrder(*this);
-
-  std::vector<std::vector<int32_t>> registerBase;
-  std::vector<std::vector<int32_t>> laneBase;
+  auto NDimName = outDimNames[order[0]];
+  auto MDimName = outDimNames[order[1]];
 
   unsigned MDim = getMDim();
   unsigned NDim = getNDim();
-  if (MDim == 32) {
-    registerBase = {{0, 1}, {0, 2}, {0, 8}, {0, 16}};
-    laneBase = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}};
-  } else if (MDim == 16) {
-    registerBase = {{0, 1}, {0, 2}};
-    laneBase = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {0, 4}, {0, 8}};
-  } else if (MDim == 64 && NDim == 4) {
-    registerBase = {{0, 1}, {0, 2}};
-    laneBase = {{1, 0}, {2, 0}, {0, 4}, {0, 8}, {0, 16}, {0, 32}};
-  } else if (MDim == 4 && NDim == 64) {
-    registerBase = {{0, 1}, {0, 2}};
-    laneBase = {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}};
-  } else if (MDim == 4 && NDim == 4) {
-    registerBase = {{0, 1}, {0, 2}};
-    laneBase = {{1, 0}, {2, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}};
+  // For all mfma instructions except for f64, height = 4
+  constexpr int height = 4;
+  constexpr int warpSize = 64;
+  // Each lane holds #elements = height, along the M dimension.
+  LinearLayout regs = LinearLayout::identity1D(height, kRegister, MDimName);
+  // Distribute the lanes along the N dimension.
+  LinearLayout lanes = LinearLayout::identity1D(NDim, kLane, NDimName);
+  // Distribute the lanes along the M dimension. If the #elements exceeds
+  // the MDim, duplicate elements across lanes - this can happen for
+  // 4x4 output.
+  if (height * warpSize / NDim <= MDim) {
+    lanes *= LinearLayout::identity1D(warpSize / NDim, kLane, MDimName);
+  } else {
+    lanes *= LinearLayout::zeros1D(warpSize / NDim, kLane, MDimName);
   }
 
-  LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
-                          {outDimNames[order[0]], outDimNames[order[1]]});
+  LinearLayout tileLayout = (regs * lanes);
+
+  // Repeat the tile along the M dimension if there are multiple blocks.
+  int blocks = (MDim * NDim) / (warpSize * height);
+  if (blocks > 0) {
+    tileLayout *= LinearLayout::identity1D(blocks, kRegister, MDimName);
+  }
+
   if (getIsTransposed())
     tileLayout = transposeLinearLayout(tileLayout, {1, 0});
 
@@ -635,47 +639,55 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   // for both cases it is [k, nonk]/[k, nonk, batch]
   auto order =
       getOrderForDotOperand(dotMfmaLayout.getOpIdx(), rank, /*kContig*/ true);
+  auto kDimName = outDimNames[order[0]];
+  auto nonKDimName = outDimNames[order[1]];
 
   // warp order
   // common for both operand A and B: [0, 1] / [0, 1, 2]
   // in both cases it is [M dim, N dim]/[batch, M dim, N dim]
   auto warpOrder = getDefaultMmaOrder(mfmaLayout);
 
-  // Lane holds kWidth consecutive elements along k dimension, so
-  // base register vectors for one tile are initialized in following way:
-  // {1, 0}, {2, 0} ... {kWidth/2, 0}
-  std::vector<std::vector<int32_t>> registerBase;
-  for (int32_t elem = 1; elem < kWidth; elem *= 2)
-    registerBase.emplace_back(std::vector<int32_t>{elem, 0});
-
-  std::vector<std::vector<int32_t>> laneBase;
-  int32_t kTileSize = -1;
   auto MDim = mfmaLayout.getMDim();
   auto NDim = mfmaLayout.getNDim();
-  if (MDim == 32) {
-    assert(NDim == 32);
-    laneBase = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {kWidth, 0}};
-    kTileSize = 2 * kWidth;
-  } else if (MDim == 16) {
-    assert(NDim == 16);
-    laneBase = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {kWidth, 0}, {kWidth * 2, 0}};
-    kTileSize = 4 * kWidth;
-  } else if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64) ||
-             (MDim == 4 && NDim == 4)) {
-    laneBase = {{0, 1},          {0, 2},          {kWidth, 0},
-                {kWidth * 2, 0}, {kWidth * 4, 0}, {kWidth * 8, 0}};
-    kTileSize = 16 * kWidth;
+  auto nonKDim = std::min(MDim, NDim); // for 32x32 and 16x16 MDim == NDim;
+                                       // for MDim == 4 or NDim == 4,
+                                       // always use nonKDim = 4
+  constexpr int warpSize = 64;
+  LinearLayout regs =
+      // One lane will hold kWidth elements along the K dimension
+      LinearLayout::identity1D(kWidth, kRegister, kDimName);
+  LinearLayout lanes =
+      // Distribute nonKDim elements along the non-K dimension
+      LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
+      // Distribute remaining elements along the K dimension
+      LinearLayout::identity1D(warpSize / nonKDim, kLane, kDimName);
+  LinearLayout tileLayout = regs * lanes;
+  tileLayout = tileLayout.transposeOuts({kDimName, nonKDimName});
+
+  // If the K is larger than the tile size, repeat the tile layout
+  // along the K dimension.
+  int kTileSize = warpSize / nonKDim * kWidth;
+  if (kSize > kTileSize) {
+    tileLayout *=
+        LinearLayout::identity1D(kSize / kTileSize, kRegister, kDimName);
   }
 
-  // Add repeats of registers along K dimension to register base vectors
-  for (int32_t elem = kTileSize; elem < kSize; elem *= 2)
-    registerBase.emplace_back(std::vector<int32_t>{elem, 0});
+  // Note MFMA4x4 instruction can produce 4x4 tiles. For 4x64 or 64x4 output,
+  // we need to compose 16 MFMA4x4 instructions. In the case MDim = 4, NDim = 64
+  // or MDim = 64, NDim = 4, we have one 64x64 operand,
+  // and another 64x4 or 4x64 operand:
+  // - For the 64x64 operand, repeat the tile layout along the non-K dimension
+  // - For the 64x4 or 4x64 operand, duplicates elements in registers
+  auto opIdx = dotMfmaLayout.getOpIdx();
+  if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64)) {
+    if ((MDim == 64 && opIdx == 0) || (NDim == 64 && opIdx == 1)) {
+      tileLayout *= LinearLayout::identity1D(16, kRegister, nonKDimName);
+    }
 
-  // Base vectors above are defined in a fixed order [k-dim, non-k-dim].
-  // To assign them to actual matrix dimensions we assoicate with register
-  // `order` which is also also [k, nonk].
-  LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
-                          {outDimNames[order[0]], outDimNames[order[1]]});
+    if ((MDim == 64 && opIdx == 1) || (NDim == 64 && opIdx == 0)) {
+      tileLayout *= LinearLayout::zeros1D(16, kRegister, kDimName);
+    }
+  }
 
   if (hasBatchDim) {
     assert(order[2] == 0);
