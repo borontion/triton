@@ -292,25 +292,25 @@ struct DotOpMFMAConversionHelper {
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
-    int numTileGroups = 1;
-    int tileGroupSize = 1;
+    int numSubtiles = 1;
+    int subtileSize = nDim;
     if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
-      numTileGroups = 16;
-      tileGroupSize = 4;
+      numSubtiles = 16;
+      subtileSize = 4;
     }
 
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM * numTileGroups, numRepK, kWidth, kBase,
+        loadedA, numRepB, numRepM * numSubtiles, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN * numTileGroups, numRepK, kWidth, kBase,
+        loadedB, numRepB, numRepN * numSubtiles, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
-    int elemsPerVec = mDim * nDim / warpSize;
-    if (mDim == 4 && nDim == 4)
-      elemsPerVec = 4;
+    int elemsPerVec =
+        std::max<unsigned>(4, mDim * nDim / warpSize); // Ensure a minimum of 4
+                                                       // elements per vec
     int numVecInKBase = numRepK * kWidth / kBase;
 
     const int subBlocks =
@@ -328,7 +328,7 @@ struct DotOpMFMAConversionHelper {
     for (int b = 0; b < numRepB; ++b) {
       for (int m = 0; m < numRepM; ++m) {
         for (int n = 0; n < numRepN; ++n) {
-          for (int g = 0; g < numTileGroups; ++g) {
+          for (int s = 0; s < numSubtiles; ++s) {
             Value acc = tb.undef(vecTy);
 
             for (int v = 0; v < elemsPerVec; ++v) {
@@ -338,7 +338,7 @@ struct DotOpMFMAConversionHelper {
               if (subBlocks > 1) {
                 Value cond = tb.icmp_eq(
                     tb.lshr(laneId, tb.i32_val(llvm::Log2_32(elemsPerVec))),
-                    tb.i32_val(numTileGroups > 1 ? g : 0));
+                    tb.i32_val(numSubtiles > 1 ? s : 0));
                 c = tb.select(cond, c, zero);
               }
 
@@ -365,16 +365,15 @@ struct DotOpMFMAConversionHelper {
             }
 
             for (int k = 0; k < numVecInKBase; ++k) {
-              acc =
-                  mfmaLayout.getIsTransposed()
-                      ? generateMFMAOp(intrinsicName,
-                                       operandB[{b, n * numTileGroups + g, k}],
-                                       operandA[{b, m * numTileGroups + g, k}],
-                                       acc)
-                      : generateMFMAOp(intrinsicName,
-                                       operandA[{b, m * numTileGroups + g, k}],
-                                       operandB[{b, n * numTileGroups + g, k}],
-                                       acc);
+              acc = mfmaLayout.getIsTransposed()
+                        ? generateMFMAOp(intrinsicName,
+                                         operandB[{b, n * numSubtiles + s, k}],
+                                         operandA[{b, m * numSubtiles + s, k}],
+                                         acc)
+                        : generateMFMAOp(intrinsicName,
+                                         operandA[{b, m * numSubtiles + s, k}],
+                                         operandB[{b, n * numSubtiles + s, k}],
+                                         acc);
               if (!firstMfma)
                 firstMfma = acc;
             }
@@ -406,10 +405,10 @@ struct DotOpMFMAConversionHelper {
                 }
               }
 
-              if (tileGroupSize > 1) {
+              if (numSubtiles > 1) {
                 Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
-                    tb.i32_val(g));
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(numSubtiles))),
+                    tb.i32_val(s));
                 d = tb.select(cond, d, c);
               }
 
@@ -430,7 +429,7 @@ struct DotOpMFMAConversionHelper {
       setPrioOp->moveAfter(firstMfma.getDefiningOp());
 
     const size_t mmaCount =
-        numRepB * numRepM * numRepN * numTileGroups * numVecInKBase;
+        numRepB * numRepM * numRepN * numSubtiles * numVecInKBase;
     packAndReplaceResult(op, fc, maybeMfmaIntrinsic, dstElemTy, elemTyA,
                          mmaCount);
 
