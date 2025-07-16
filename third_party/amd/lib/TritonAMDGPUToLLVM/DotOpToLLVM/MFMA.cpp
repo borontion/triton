@@ -410,6 +410,7 @@ struct DotOpMFMAConversionHelper {
                     tb.i32_val(g));
                 d = tb.select(cond, d, c);
               }
+
               fc[linearIdx] = d;
             }
           }
