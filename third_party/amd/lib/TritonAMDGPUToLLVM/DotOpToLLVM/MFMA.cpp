@@ -292,7 +292,7 @@ struct DotOpMFMAConversionHelper {
     assert(repA[0] == repB[0]);
 
     int numTileGroups = 1;
-    int tileGroupSize = -1;
+    int tileGroupSize = 1;
     if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
       numTileGroups = 16;
       tileGroupSize = 4;
@@ -336,12 +336,12 @@ struct DotOpMFMAConversionHelper {
 
               if (subBlocks > 1) {
                 Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
-                    tb.i32_val(g));
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(elemsPerVec))),
+                    tb.i32_val(numTileGroups > 1 ? g : 0));
                 c = tb.select(cond, c, zero);
               }
 
-              if (subBlocks > 1 && kDimInstrSize > kDimOperandSize) {
+              if ((kDimInstrSize > kDimOperandSize) && subBlocks > 1) {
                 assert(kDimInstrSize % kDimOperandSize == 0);
                 int duplicationRate = kDimInstrSize / kDimOperandSize;
                 assert(llvm::isPowerOf2_32(duplicationRate));
@@ -404,7 +404,7 @@ struct DotOpMFMAConversionHelper {
                 }
               }
 
-              if (subBlocks > 1) {
+              if (tileGroupSize > 1) {
                 Value cond = tb.icmp_eq(
                     tb.lshr(laneId, tb.i32_val(llvm::Log2_32(tileGroupSize))),
                     tb.i32_val(g));
