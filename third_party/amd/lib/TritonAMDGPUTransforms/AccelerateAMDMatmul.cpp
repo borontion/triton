@@ -454,17 +454,17 @@ public:
     auto nDim = mfmaInstr->nDim;
     auto kDim = mfmaInstr->kDim;
     auto kBase = mfmaInstr->kBase;
-
+    auto aElemTy = mfmaInstr->aElementType;
     auto warpsPerTile =
         warpsPerTileMFMA(dotOp, retShape, numWarps, {mDim, nDim});
 
     // Use transposed mfma layout to enable larger vectorization for global
     // store instructions.
-    auto aElemTy = mfmaInstr->aElementType;
+    bool isTransposed = (mDim == nDim);
     ttg::AMDMfmaEncodingAttr mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
         oldRetType.getContext(),
         /*version*/ mfmaVersion, warpsPerTile,
-        /*instrShape*/ mDim, nDim, /*isTransposed=*/true, CTALayout);
+        /*instrShape*/ mDim, nDim, isTransposed, CTALayout);
 
     Type mfmaAccType;
     if (oldRetType.getElementType().isIntOrIndex())
