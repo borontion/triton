@@ -679,7 +679,7 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   // we need to compose 16 MFMA4x4 instructions. In these cases:
   // - For the 64x64 operand, repeat the tile layout along the non-K dimension
   // - For the 64x4 or 4x64 operand, duplicates elements in registers to match
-  //   the other operand
+  //   the other operand along the non-K dimension.
   auto opIdx = dotMfmaLayout.getOpIdx();
   if ((MDim == 64 && NDim == 4) || (MDim == 4 && NDim == 64)) {
     if ((MDim == 64 && opIdx == 0) || (NDim == 64 && opIdx == 1)) {
@@ -687,7 +687,7 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
     }
 
     if ((MDim == 64 && opIdx == 1) || (NDim == 64 && opIdx == 0)) {
-      tileLayout *= LinearLayout::zeros1D(16, kRegister, kDimName);
+      tileLayout *= LinearLayout::zeros1D(16, kRegister, nonKDimName);
     }
   }
 
