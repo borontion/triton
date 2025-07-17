@@ -224,6 +224,11 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
   auto nDim = mfmaLayout.getNDim();
   assert((mDim == nDim && (mDim == 32 || mDim == 16 || mDim == 4)) ||
          (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
+
+  // TODO: Enable for 64x4 and 4x64 cases
+  if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
+    return Value();
+
   auto warpsPerCTA = mfmaLayout.getWarpsPerCTA();
 
   auto sharedLayout =
@@ -282,14 +287,8 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
       rewriter, loc, linearWarpId, warpsPerCTA, mfmaInstrNonK,
       shape[nonKDimIdx], nonKDimIdx, warpOrder);
 
-  // For the 64x4 or 4x64 operand, duplicates elements 16 times
-  int duplicates = 1;
-  if (((mDim == 64 && nDim == 4) && opIdx == 1) ||
-      (mDim == 4 && nDim == 64) && opIdx == 0)
-    duplicates = 16;
-
   // numOfElemsPerThreadPerMfmaInstr
-  int numOfElems = mfmaInstrNonK * mfmaInstrK * duplicates / iWarpSize;
+  int numOfElems = mfmaInstrNonK * mfmaInstrK / iWarpSize;
   assert(numOfElems >= 1);
 
   unsigned int maxNumWarps = shape[nonKDimIdx] / mfmaInstrNonK;
@@ -345,13 +344,13 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
       offsets = AMD::computeOffsetsAType(
           rewriter, loc, computeTensorElemMappingInBlock, elemsPerInstr,
           spatialWarpId, lane, warpsPerBlockNonK, numOfElems, numReps, smemObj,
-          smemStrides, sharedLayout, mDim * duplicates, mfmaInstrK);
+          smemStrides, sharedLayout, mDim, mfmaInstrK);
     } else {
       assert(opIdx == 1);
       offsets = AMD::computeOffsetsBType(
           rewriter, loc, computeTensorElemMappingInBlock, elemsPerInstr,
           spatialWarpId, lane, warpsPerBlockNonK, numOfElems, numReps, smemObj,
-          smemStrides, sharedLayout, nDim * duplicates, mfmaInstrK);
+          smemStrides, sharedLayout, nDim, mfmaInstrK);
     }
     smemBase = AMD::computeBasePtr(rewriter, loc, smemObj, smemStrides);
   }

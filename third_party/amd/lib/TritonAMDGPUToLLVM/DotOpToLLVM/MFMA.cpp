@@ -292,19 +292,17 @@ struct DotOpMFMAConversionHelper {
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
-    int numSubtiles = 1;
-    int subtileSize = nDim;
-    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
-      numSubtiles = 16;
-      subtileSize = 4;
-    }
+    int subTiles = 1;
+    int nonKDim = std::min(mDim, nDim);
+    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
+      subTiles = 16;
 
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM * numSubtiles, numRepK, kWidth, kBase,
+        loadedA, numRepB, numRepM * subTiles, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN * numSubtiles, numRepK, kWidth, kBase,
+        loadedB, numRepB, numRepN * subTiles, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
@@ -328,86 +326,47 @@ struct DotOpMFMAConversionHelper {
     for (int b = 0; b < numRepB; ++b) {
       for (int m = 0; m < numRepM; ++m) {
         for (int n = 0; n < numRepN; ++n) {
-          for (int s = 0; s < numSubtiles; ++s) {
+          for (int s = 0; s < subTiles; ++s) {
             Value acc = tb.undef(vecTy);
 
             for (int v = 0; v < elemsPerVec; ++v) {
               int linearIdx = linearize({b, m, n, v}, fcStrides);
               Value c = fc[linearIdx];
 
-              if (subBlocks > 1) {
+              if (subBlocks > 1 || subTiles > 1) {
                 Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(elemsPerVec))),
-                    tb.i32_val(numSubtiles > 1 ? s : 0));
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(nonKDim))),
+                    tb.i32_val(s));
                 c = tb.select(cond, c, zero);
-              }
-
-              if ((kDimInstrSize > kDimOperandSize) && subBlocks > 1) {
-                assert(kDimInstrSize % kDimOperandSize == 0);
-                int duplicationRate = kDimInstrSize / kDimOperandSize;
-                assert(llvm::isPowerOf2_32(duplicationRate));
-
-                if (dstElemTy.isInteger()) {
-                  auto shiftSize = llvm::Log2_32(duplicationRate);
-                  assert(!c.getType().isUnsignedInteger() &&
-                         "MFMA uses signed accumulator");
-                  c = tb.shl(c, tb.i32_val(shiftSize));
-                } else {
-                  auto multiplierAttr =
-                      rewriter.getFloatAttr(dstElemTy, duplicationRate);
-                  auto multiplierVal = rewriter.create<LLVM::ConstantOp>(
-                      loc, dstElemTy, multiplierAttr);
-                  c = tb.fmul(c, multiplierVal);
-                }
               }
 
               acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
             }
 
             for (int k = 0; k < numVecInKBase; ++k) {
-              acc = mfmaLayout.getIsTransposed()
-                        ? generateMFMAOp(intrinsicName,
-                                         operandB[{b, n * numSubtiles + s, k}],
-                                         operandA[{b, m * numSubtiles + s, k}],
-                                         acc)
-                        : generateMFMAOp(intrinsicName,
-                                         operandA[{b, m * numSubtiles + s, k}],
-                                         operandB[{b, n * numSubtiles + s, k}],
-                                         acc);
+              acc =
+                  mfmaLayout.getIsTransposed()
+                      ? generateMFMAOp(intrinsicName,
+                                       operandB[{b, n * subTiles + s, k}],
+                                       operandA[{b, m * subTiles + s, k}], acc)
+                      : generateMFMAOp(intrinsicName,
+                                       operandA[{b, m * subTiles + s, k}],
+                                       operandB[{b, n * subTiles + s, k}], acc);
               if (!firstMfma)
                 firstMfma = acc;
             }
 
-            // TODO(pengzhan): double-check the reduction algorithm
-            acc = reduceSubBlocks(subBlocks, acc);
+            if (subBlocks > 1)
+              acc = reduceSubBlocks(subBlocks, acc);
 
             for (int v = 0; v < elemsPerVec; ++v) {
               int linearIdx = linearize({b, m, n, v}, fcStrides);
               Value c = fc[linearIdx];
               Value d = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
 
-              if (kDimInstrSize > kDimOperandSize) {
-                assert(kDimInstrSize % kDimOperandSize == 0);
-                int duplicationRate = kDimInstrSize / kDimOperandSize;
-                assert(llvm::isPowerOf2_32(duplicationRate));
-
-                if (dstElemTy.isInteger()) {
-                  auto shiftSize = llvm::Log2_32(duplicationRate);
-                  assert(!d.getType().isUnsignedInteger() &&
-                         "MFMA uses signed accumulator");
-                  d = tb.ashr(d, tb.i32_val(shiftSize));
-                } else {
-                  auto multiplierAttr =
-                      rewriter.getFloatAttr(dstElemTy, 1.0 / duplicationRate);
-                  auto multiplierVal = rewriter.create<LLVM::ConstantOp>(
-                      loc, dstElemTy, multiplierAttr);
-                  d = tb.fmul(d, multiplierVal);
-                }
-              }
-
-              if (numSubtiles > 1) {
+              if (subTiles > 1) {
                 Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(numSubtiles))),
+                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(nonKDim))),
                     tb.i32_val(s));
                 d = tb.select(cond, d, c);
               }
@@ -429,7 +388,7 @@ struct DotOpMFMAConversionHelper {
       setPrioOp->moveAfter(firstMfma.getDefiningOp());
 
     const size_t mmaCount =
-        numRepB * numRepM * numRepN * numSubtiles * numVecInKBase;
+        numRepB * numRepM * numRepN * subTiles * numVecInKBase;
     packAndReplaceResult(op, fc, maybeMfmaIntrinsic, dstElemTy, elemTyA,
                          mmaCount);
 
