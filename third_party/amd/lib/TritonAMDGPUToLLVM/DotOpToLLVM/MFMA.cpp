@@ -293,23 +293,22 @@ struct DotOpMFMAConversionHelper {
     assert(repA[0] == repB[0]);
 
     int subTiles = 1;
-    int nonKDim = std::min(mDim, nDim);
     if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
       subTiles = 16;
 
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM * subTiles, numRepK, kWidth, kBase,
+        loadedA, numRepB, numRepM, numRepK * subTiles, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN * subTiles, numRepK, kWidth, kBase,
+        loadedB, numRepB, numRepN, numRepK * subTiles, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
     int elemsPerVec =
         std::max<unsigned>(4, mDim * nDim / warpSize); // Ensure a minimum of 4
                                                        // elements per vec
-    int numVecInKBase = numRepK * kWidth / kBase;
+    int numVecInKBase = subTiles * numRepK * kWidth / kBase;
 
     const int subBlocks =
         getNumSubmatrices(aTensorTy.getElementType(), mDim, nDim);
@@ -326,53 +325,27 @@ struct DotOpMFMAConversionHelper {
     for (int b = 0; b < numRepB; ++b) {
       for (int m = 0; m < numRepM; ++m) {
         for (int n = 0; n < numRepN; ++n) {
-          for (int s = 0; s < subTiles; ++s) {
-            Value acc = tb.undef(vecTy);
+          Value acc = tb.undef(vecTy);
 
-            for (int v = 0; v < elemsPerVec; ++v) {
-              int linearIdx = linearize({b, m, n, v}, fcStrides);
-              Value c = fc[linearIdx];
+          for (int v = 0; v < elemsPerVec; ++v) {
+            int linearIdx = linearize({b, m, n, v}, fcStrides);
+            Value c = fc[linearIdx];
+            acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
+          }
 
-              if (subBlocks > 1 || subTiles > 1) {
-                Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(nonKDim))),
-                    tb.i32_val(s));
-                c = tb.select(cond, c, zero);
-              }
+          for (int k = 0; k < numVecInKBase; ++k) {
+            acc = mfmaLayout.getIsTransposed()
+                      ? generateMFMAOp(intrinsicName, operandB[{b, n, k}],
+                                       operandA[{b, m, k}], acc)
+                      : generateMFMAOp(intrinsicName, operandA[{b, m, k}],
+                                       operandB[{b, n, k}], acc);
+            if (!firstMfma)
+              firstMfma = acc;
+          }
 
-              acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
-            }
-
-            for (int k = 0; k < numVecInKBase; ++k) {
-              acc =
-                  mfmaLayout.getIsTransposed()
-                      ? generateMFMAOp(intrinsicName,
-                                       operandB[{b, n * subTiles + s, k}],
-                                       operandA[{b, m * subTiles + s, k}], acc)
-                      : generateMFMAOp(intrinsicName,
-                                       operandA[{b, m * subTiles + s, k}],
-                                       operandB[{b, n * subTiles + s, k}], acc);
-              if (!firstMfma)
-                firstMfma = acc;
-            }
-
-            if (subBlocks > 1)
-              acc = reduceSubBlocks(subBlocks, acc);
-
-            for (int v = 0; v < elemsPerVec; ++v) {
-              int linearIdx = linearize({b, m, n, v}, fcStrides);
-              Value c = fc[linearIdx];
-              Value d = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
-
-              if (subTiles > 1) {
-                Value cond = tb.icmp_eq(
-                    tb.lshr(laneId, tb.i32_val(llvm::Log2_32(nonKDim))),
-                    tb.i32_val(s));
-                d = tb.select(cond, d, c);
-              }
-
-              fc[linearIdx] = d;
-            }
+          for (int v = 0; v < elemsPerVec; ++v) {
+            int linearIdx = linearize({b, m, n, v}, fcStrides);
+            fc[linearIdx] = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
           }
         }
       }

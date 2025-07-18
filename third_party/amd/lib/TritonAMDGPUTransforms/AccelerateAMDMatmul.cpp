@@ -165,8 +165,6 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
       } else if (N >= 64) {
         mDim = 4;
         nDim = 64;
-      } else {
-        mDim = nDim = 4;
       }
     }
   }

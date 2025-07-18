@@ -652,9 +652,11 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
 
   auto mDim = mfmaLayout.getMDim();
   auto nDim = mfmaLayout.getNDim();
-  auto nonKDim = std::min(mDim, nDim); // for 4x64 and 64x4, nonKDim = 4
+  auto opIdx = dotMfmaLayout.getOpIdx();
+  auto nonKDim = opIdx == 0 ? mDim : nDim;
   constexpr int warpSize = 64;
 
+  LinearLayout tileLayout = LinearLayout::empty();
   // One lane will hold kWidth elements along the K dimension
   LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, kDimName);
   // First distribute nonKDim elements along the non-K dimension,
@@ -662,34 +664,35 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   LinearLayout lanes =
       LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
       LinearLayout::identity1D(warpSize / nonKDim, kLane, kDimName);
-  LinearLayout tileLayout = regs * lanes;
-  tileLayout = tileLayout.transposeOuts({kDimName, nonKDimName});
+  tileLayout = regs * lanes;
+
+  int kTileSize = warpSize / nonKDim * kWidth;
+
+  // Special handling for 64x4 and 4x64 tile
+  if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
+    bool isSkinny = (mDim == 64 && nDim == 4 && opIdx == 1) ||
+                    (mDim == 4 && nDim == 64 && opIdx == 0);
+    if (isSkinny) {
+      LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, kDimName);
+      LinearLayout lanes =
+          LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
+          LinearLayout::zeros1D(warpSize / nonKDim, kLane, kDimName);
+      tileLayout = regs * lanes;
+    }
+
+    tileLayout *= LinearLayout::identity1D(16, kRegister, kDimName);
+
+    kTileSize = 64;
+  }
 
   // If the K is larger than the tile size, repeat the tile layout
   // along the K dimension.
-  int kTileSize = warpSize / nonKDim * kWidth;
   if (kSize > kTileSize) {
     tileLayout *=
         LinearLayout::identity1D(kSize / kTileSize, kRegister, kDimName);
   }
 
-  // MFMA4x4 instruction will produce 4x4 tiles. For 4x64 or 64x4 output,
-  // we need to compose 16 MFMA4x4 instructions. In these cases:
-  // - For the 64x64 operand, repeat the tile layout along the non-K dimension
-  // - For the 64x4 or 4x64 operand, duplicates elements in registers to match
-  //   the other operand along the non-K dimension.
-  auto opIdx = dotMfmaLayout.getOpIdx();
-  if ((mDim == 64 && nDim == 4)) {
-    tileLayout *= opIdx == 0
-                      ? LinearLayout::identity1D(16, kRegister, nonKDimName)
-                      : LinearLayout::zeros1D(16, kRegister, nonKDimName);
-  }
-  if ((mDim == 4 && nDim == 64)) {
-    tileLayout *= opIdx == 1
-                      ? LinearLayout::identity1D(16, kRegister, nonKDimName)
-                      : LinearLayout::zeros1D(16, kRegister, nonKDimName);
-  }
-
+  tileLayout = tileLayout.transposeOuts({kDimName, nonKDimName});
   if (hasBatchDim) {
     assert(order[2] == 0);
     // Extend the base vector with one value to accommodate for the batch
