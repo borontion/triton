@@ -414,36 +414,47 @@ AMDMfmaEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
 
   unsigned mDim = getMDim();
   unsigned nDim = getNDim();
-  constexpr int height = 4; // For all mfma instructions except for f64,
-                            // height = 4
+  constexpr int height = 4; // Applies for all mfma instructions except for f64
   constexpr int warpSize = 64;
 
-  // Each lane holds #elements = height, along the M dimension.
+  // Each lane holds 'height' elements along the M dimension.
   LinearLayout regs = LinearLayout::identity1D(height, kRegister, mDimName);
-
   // First, distribute the lanes along the N dimension.
   // Then, distribute the lanes along the M dimension. If the #elements exceeds
   // the mDim, duplicate elements across lanes - this can happen for
   // 4x4 output.
-  LinearLayout lanes = LinearLayout::identity1D(nDim, kLane, nDimName);
-  if (height * warpSize / nDim <= mDim) {
-    lanes *= LinearLayout::identity1D(warpSize / nDim, kLane, mDimName);
-  } else {
-    lanes *= LinearLayout::zeros1D(warpSize / nDim, kLane, mDimName);
-  }
-
+  LinearLayout lanes =
+      LinearLayout::identity1D(nDim, kLane, nDimName) *
+      LinearLayout::identity1D(warpSize / nDim, kLane, mDimName);
   LinearLayout tileLayout = (regs * lanes);
-  tileLayout = tileLayout.transposeOuts({nDimName, mDimName});
 
   // Repeat the above distribution along the M dimension to fits the tile.
   int tiles = (mDim * nDim) / (warpSize * height);
-  if (tiles > 0) {
+  if (tiles > 0)
     tileLayout *= LinearLayout::identity1D(tiles, kRegister, mDimName);
+
+  bool isTransposed = getIsTransposed();
+
+  // Special case for 64x4 mfma: we always transpose the output to turn
+  // the 64x4 mfma into a equalvalent 4x64 mfma and swap operand A and B, so
+  // that we can use the mfma broadcast.
+  if (mDim == 64 && nDim == 4)
+    isTransposed = !isTransposed;
+
+  // For the transposed output, we will use the same method for layout but
+  // swap the order of the M and N dimensions.
+  if (isTransposed) {
+    LinearLayout regs = LinearLayout::identity1D(height, kRegister, nDimName);
+    LinearLayout lanes =
+        LinearLayout::identity1D(mDim, kLane, mDimName) *
+        LinearLayout::identity1D(warpSize / mDim, kLane, nDimName);
+    tileLayout = (regs * lanes);
+
+    if (tiles > 0)
+      tileLayout *= LinearLayout::identity1D(tiles, kRegister, nDimName);
   }
 
-  if (getIsTransposed())
-    tileLayout = transposeLinearLayout(tileLayout, {1, 0});
-
+  tileLayout = tileLayout.transposeOuts({nDimName, mDimName});
   if (hasBatchDim) {
     assert(order[2] == 0);
     // Extend the base vector with one value to accommodate for the batch
@@ -656,41 +667,20 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   auto nonKDim = opIdx == 0 ? mDim : nDim;
   constexpr int warpSize = 64;
 
-  LinearLayout tileLayout = LinearLayout::empty();
-  // One lane will hold kWidth elements along the K dimension
+  // Each lane holds kWidth elements along the K dimension
   LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, kDimName);
   // First distribute nonKDim elements along the non-K dimension,
   // then distribute remaining elements along the K dimension
   LinearLayout lanes =
       LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
       LinearLayout::identity1D(warpSize / nonKDim, kLane, kDimName);
-  tileLayout = regs * lanes;
+  LinearLayout tileLayout = regs * lanes;
 
-  int kTileSize = warpSize / nonKDim * kWidth;
-
-  // Special handling for 64x4 and 4x64 tile
-  if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64)) {
-    bool isSkinny = (mDim == 64 && nDim == 4 && opIdx == 1) ||
-                    (mDim == 4 && nDim == 64 && opIdx == 0);
-    if (isSkinny) {
-      LinearLayout regs = LinearLayout::identity1D(kWidth, kRegister, kDimName);
-      LinearLayout lanes =
-          LinearLayout::identity1D(nonKDim, kLane, nonKDimName) *
-          LinearLayout::zeros1D(warpSize / nonKDim, kLane, kDimName);
-      tileLayout = regs * lanes;
-    }
-
+  // Special case for 4x64 and 64x4 mfma: for the 64x64 operand,
+  // we need to repeat the layout 16 times along the K dimension
+  if ((mDim == 64 && nDim == 4 && opIdx == 0) ||
+      (mDim == 4 && nDim == 64 && opIdx == 1))
     tileLayout *= LinearLayout::identity1D(16, kRegister, kDimName);
-
-    kTileSize = 64;
-  }
-
-  // If the K is larger than the tile size, repeat the tile layout
-  // along the K dimension.
-  if (kSize > kTileSize) {
-    tileLayout *=
-        LinearLayout::identity1D(kSize / kTileSize, kRegister, kDimName);
-  }
 
   tileLayout = tileLayout.transposeOuts({kDimName, nonKDimName});
   if (hasBatchDim) {

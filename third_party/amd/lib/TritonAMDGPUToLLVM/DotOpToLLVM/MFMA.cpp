@@ -78,13 +78,22 @@ struct DotOpMFMAConversionHelper {
         typeConverter(typeConverter), loc(loc), ctx(mfmaLayout.getContext()) {}
 
   Value generateMFMAOp(StringRef intrinsicName, Value valA, Value valB,
-                       Value valC) const {
+                       Value valC, int cbsz = 0, int abid = 0,
+                       int blgp = 0) const {
+    assert(cbsz >= 0 && cbsz <= 4);
+    assert(abid >= 0 && abid <= 15);
+    assert(blgp >= 0 && blgp <= 7);
+
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto resType = valC.getType();
     Value zeroFlag = b.i32_val(0);
+    Value cbszFlag = cbsz != 0 ? b.i32_val(cbsz) : zeroFlag;
+    Value abidFlag = abid != 0 ? b.i32_val(abid) : zeroFlag;
+    Value blgpFlag = blgp != 0 ? b.i32_val(blgp) : zeroFlag;
+
+    auto resType = valC.getType();
     OperationState loweredOp(loc, intrinsicName);
     loweredOp.addTypes(resType);
-    loweredOp.addOperands({valA, valB, valC, zeroFlag, zeroFlag, zeroFlag});
+    loweredOp.addOperands({valA, valB, valC, cbszFlag, abidFlag, blgpFlag});
     return rewriter.create(loweredOp)->getResult(0);
   }
 
@@ -238,7 +247,7 @@ struct DotOpMFMAConversionHelper {
     auto mDim = mfmaLayout.getMDim();
     auto nDim = mfmaLayout.getNDim();
     auto mfmaVersion = mfmaLayout.getVersion();
-    assert((mDim == nDim && (mDim == 32 || mDim == 16 || mDim == 4)) ||
+    assert((mDim == nDim && (mDim == 32 || mDim == 16)) ||
            (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
 
     Value a = op.getA();
@@ -292,26 +301,32 @@ struct DotOpMFMAConversionHelper {
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
-    int subTiles = 1;
-    if ((mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64))
-      subTiles = 16;
+    int numBroadcastA = 1;
+    int numBroadcastB = 1;
+    int numRepKA = numRepK;
+    int numRepKB = numRepK;
+    if ((mDim == 64 && nDim == 4)) {
+      numBroadcastB = 16;
+      numRepKA *= 16;
+    }
+    if ((mDim == 4 && nDim == 64)) {
+      numBroadcastA = 16;
+      numRepKB *= 16;
+    }
+    numRepK = std::max(numRepKA, numRepKB);
+    int numBroadcast = std::max(numBroadcastA, numBroadcastB);
 
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepK * subTiles, kWidth, kBase,
+        loadedA, numRepB, numRepM, numRepKA, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepK * subTiles, kWidth, kBase,
+        loadedB, numRepB, numRepN, numRepKB, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
-    int elemsPerVec =
-        std::max<unsigned>(4, mDim * nDim / warpSize); // Ensure a minimum of 4
-                                                       // elements per vec
-    int numVecInKBase = subTiles * numRepK * kWidth / kBase;
-
-    const int subBlocks =
-        getNumSubmatrices(aTensorTy.getElementType(), mDim, nDim);
+    int elemsPerVec = mDim * nDim / warpSize;
+    int numVecInKBase = numRepK * kWidth / kBase;
 
     auto dstElemTy = dTensorTy.getElementType();
     auto fc = unpackLLElements(loc, loadedC, rewriter);
@@ -334,11 +349,30 @@ struct DotOpMFMAConversionHelper {
           }
 
           for (int k = 0; k < numVecInKBase; ++k) {
-            acc = mfmaLayout.getIsTransposed()
-                      ? generateMFMAOp(intrinsicName, operandB[{b, n, k}],
-                                       operandA[{b, m, k}], acc)
-                      : generateMFMAOp(intrinsicName, operandA[{b, m, k}],
-                                       operandB[{b, n, k}], acc);
+            Value op1 = operandA[{b, m, k}];
+            Value op2 = operandB[{b, n, k}];
+            int cbsz = 0;
+            int abid = 0;
+
+            if (numBroadcastA > 1) {
+              cbsz = llvm::Log2_32(numBroadcastA);
+              abid = k % numBroadcastA;
+              op1 = operandA[{b, m, k / numBroadcastA}];
+            }
+
+            if (numBroadcastB > 1) {
+              assert(numBroadcastA == 1);
+              cbsz = llvm::Log2_32(numBroadcastB);
+              abid = k % numBroadcastB;
+              op2 = operandB[{b, n, k / numBroadcastB}];
+              std::swap(op1, op2);
+            }
+
+            if (mfmaLayout.getIsTransposed())
+              std::swap(op1, op2);
+
+            acc = generateMFMAOp(intrinsicName, op1, op2, acc, cbsz, abid);
+
             if (!firstMfma)
               firstMfma = acc;
           }
@@ -358,8 +392,7 @@ struct DotOpMFMAConversionHelper {
     if (setPrioOp && firstMfma)
       setPrioOp->moveAfter(firstMfma.getDefiningOp());
 
-    const size_t mmaCount =
-        numRepB * numRepM * numRepN * subTiles * numVecInKBase;
+    const size_t mmaCount = numRepB * numRepM * numRepN * numVecInKBase;
     packAndReplaceResult(op, fc, maybeMfmaIntrinsic, dstElemTy, elemTyA,
                          mmaCount);
 
