@@ -343,10 +343,8 @@ struct DotOpMFMAConversionHelper {
               firstMfma = acc;
           }
 
-          for (int v = 0; v < elemsPerVec; ++v) {
-            int linearIdx = linearize({b, m, n, v}, fcStrides);
-            fc[linearIdx] = tb.extract_element(dstElemTy, acc, tb.i32_val(v));
-          }
+          adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
+                                kDimInstrSize, kDimOperandSize, elemsPerVec);
         }
       }
     }
