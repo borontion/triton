@@ -416,6 +416,8 @@ public:
     if (!isa_and_nonnull<BlockedEncodingAttr>(dotOp.getType().getEncoding()))
       return rewriter.notifyMatchFailure(
           dotOp, "expected blocked encoding result tensor");
+    if (nonKDim < 0)
+      return failure();
 
     auto CTALayout = ttg::getCTALayout(oldRetType.getEncoding());
 
