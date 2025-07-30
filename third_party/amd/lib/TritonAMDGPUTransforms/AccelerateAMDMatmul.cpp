@@ -140,6 +140,9 @@ FailureOr<MfmaIntrinsic>
 chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
                       Type aElemType, Type bElemType, int inputKSize,
                       int enforcedNonKDim, bool withScale, bool allowXF32) {
+  if (enforcedNonKDim < 0)
+    return failure();
+
   // number of matrix elements along k dim per one MFMA instruction
   unsigned kDim = 0;
 
@@ -151,7 +154,15 @@ chooseMfmaInstruction(Location loc, int mfmaVersion, RankedTensorType cType,
   unsigned mDim = 0;
   unsigned nDim = 0;
   if (enforcedNonKDim != 0) {
-    mDim = nDim = enforcedNonKDim;
+    if (enforcedNonKDim == 464) {
+      mDim = 4;
+      nDim = 64;
+    } else if (enforcedNonKDim == 644) {
+      mDim = 64;
+      nDim = 4;
+    } else {
+      mDim = nDim = enforcedNonKDim;
+    }
   } else {
     int minSize = std::min(M, N);
     if (minSize >= 32) {
@@ -416,8 +427,6 @@ public:
     if (!isa_and_nonnull<BlockedEncodingAttr>(dotOp.getType().getEncoding()))
       return rewriter.notifyMatchFailure(
           dotOp, "expected blocked encoding result tensor");
-    if (nonKDim < 0)
-      return failure();
 
     auto CTALayout = ttg::getCTALayout(oldRetType.getEncoding());
 
