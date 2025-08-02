@@ -297,27 +297,12 @@ struct DotOpMFMAConversionHelper {
     auto numRepB = repA[0];
     assert(repA[0] == repB[0]);
 
-    int numBroadcastA = 1;
-    int numBroadcastB = 1;
-    int numRepKA = numRepK;
-    int numRepKB = numRepK;
-    if ((mDim == 64 && nDim == 4)) {
-      numBroadcastB = 16;
-      numRepKA *= 16;
-    }
-    if ((mDim == 4 && nDim == 64)) {
-      numBroadcastA = 16;
-      numRepKB *= 16;
-    }
-    numRepK = std::max(numRepKA, numRepKB);
-    int numBroadcast = std::max(numBroadcastA, numBroadcastB);
-
     bool preserveBF16 = intrinsicName.contains(".bf16") && mfmaVersion >= 4;
     auto operandA = getValuesFromDotOperandLayoutStruct(
-        loadedA, numRepB, numRepM, numRepKA, kWidth, kBase,
+        loadedA, numRepB, numRepM, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
     auto operandB = getValuesFromDotOperandLayoutStruct(
-        loadedB, numRepB, numRepN, numRepKB, kWidth, kBase,
+        loadedB, numRepB, numRepN, numRepK, kWidth, kBase,
         aTensorTy.getElementType(), allowXF32, preserveBF16);
 
     int warpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
@@ -345,28 +330,10 @@ struct DotOpMFMAConversionHelper {
           for (int k = 0; k < numVecInKBase; ++k) {
             Value op1 = operandA[{b, m, k}];
             Value op2 = operandB[{b, n, k}];
-            int cbsz = 0;
-            int abid = 0;
-
-            if (numBroadcastA > 1) {
-              assert(!mfmaLayout.getIsTransposed());
-              cbsz = llvm::Log2_32(numBroadcastA);
-              abid = k % numBroadcastA;
-              op1 = operandA[{b, m, k / numBroadcastA}];
-            }
-
-            if (numBroadcastB > 1) {
-              assert(numBroadcastA == 1);
-              assert(mfmaLayout.getIsTransposed());
-              cbsz = llvm::Log2_32(numBroadcastB);
-              abid = k % numBroadcastB;
-              op2 = operandB[{b, n, k / numBroadcastB}];
-            }
-
             if (mfmaLayout.getIsTransposed())
               std::swap(op1, op2);
 
-            acc = generateMFMAOp(intrinsicName, op1, op2, acc, cbsz, abid);
+            acc = generateMFMAOp(intrinsicName, op1, op2, acc);
 
             if (!firstMfma)
               firstMfma = acc;

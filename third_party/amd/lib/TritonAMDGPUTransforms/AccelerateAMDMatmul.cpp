@@ -480,14 +480,12 @@ public:
       mfmaAccType = rewriter.getF32Type();
 
     // Use transposed mfma layout to enable larger vectorization for global
-    // store instructions. We can not support transposed mfma 4x64 as it
-    // requires to broadcast the operand A.
-    bool isTransposed = !(mDim == 4 && nDim == 64);
+    // store instructions.
     auto aElemTy = mfmaInstr->aElementType;
     ttg::AMDMfmaEncodingAttr mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
         oldRetType.getContext(),
         /*version*/ mfmaVersion, warpsPerTile,
-        /*instrShape*/ mDim, nDim, /*isTransposed=*/isTransposed, CTALayout,
+        /*instrShape*/ mDim, nDim, /*isTransposed=*/true, CTALayout,
         mfmaAccType);
 
     // convert accumulator
@@ -510,7 +508,7 @@ public:
     // 4. relation between kBase and kDim:
     //    4.1 For mfma_32, kBase = kDim / 2
     //    4.2 For mfma_16, kBase = kDim / 4
-    //    4.3 For mfma_4, kBase = kDim / 16
+    //    4.3 For mfma_4x64 and mfma_64x4, kBase = kDim
     // 5. relation between kWidth and kBase: For now it supports two cases
     //    5.1 kWidth = kBase, i.e. kPack = 1. In this case, each load from
     //        shared memory results in one mfma instruction.

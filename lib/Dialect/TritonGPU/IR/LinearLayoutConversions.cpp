@@ -773,17 +773,16 @@ LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
   LinearLayout lanes =
       LinearLayout::identity1D(nonKDim, kLane, dimNonK) *
       LinearLayout::identity1D(warpSize / nonKDim, kLane, dimK);
+  // Special case for 4x64 and 64x4 mfma: for the 4x4 operand,
+  // we need to duplicate the layout 16 times along the K dimension
+  if ((mDim == 64 && nDim == 4 && opIdx == 1) ||
+      (mDim == 4 && nDim == 64 && opIdx == 0)) {
+    lanes = LinearLayout::identity1D(nonKDim, kLane, dimNonK) *
+            LinearLayout::zeros1D(warpSize / nonKDim, kLane, dimK);
+  }
   LinearLayout tileLayout = regs * lanes;
 
-  int kTileSize = warpSize / nonKDim * kWidth;
-  // Special case for 4x64 and 64x4 mfma: for the 64x64 operand,
-  // we need to repeat the layout 16 times along the K dimension
-  if ((mDim == 64 && nDim == 4 && opIdx == 0) ||
-      (mDim == 4 && nDim == 64 && opIdx == 1)) {
-    tileLayout *= LinearLayout::identity1D(16, kRegister, dimK);
-    kTileSize *= 16;
-  }
-
+  int kTileSize = tileLayout.getOutDimSize(dimK);
   // If shape K is larger than the tile size, repeat the tile
   // along the K dimension.
   if (kSize > kTileSize) {
