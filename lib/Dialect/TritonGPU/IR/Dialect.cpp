@@ -1934,8 +1934,9 @@ AMDMfmaEncodingAttr::getInstrShapeForOperand(int kWidth, int opIdx) const {
          (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
 
   constexpr int warpSize = 64; // MFMA is always based on the 64-wide warps.
-  int kGroups = warpSize / std::min(mDim, nDim); // for 64x4 and 4x64,
-                                                 // kGroups = 16
+  int kGroups = 1;
+  if (mDim == nDim)
+    kGroups = warpSize / mDim;
   int64_t kDim = kWidth * kGroups;
 
   if (opIdx == 0)
