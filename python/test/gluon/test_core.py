@@ -1,8 +1,9 @@
 import torch
 import pytest
 
-from triton._internal_testing import is_cuda, is_ampere_or_newer, is_hopper_or_newer, is_hopper
+from triton._internal_testing import is_cuda, is_ampere_or_newer, is_hopper_or_newer, is_hopper, is_hip_cdna
 from triton.experimental import gluon
+from triton.experimental.gluon.language.extra import libdevice
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mbarrier
 from triton.experimental.gluon.language.nvidia.hopper import tma
@@ -142,3 +143,46 @@ def test_warpgroup_mma(ASYNC):
     ref = torch.matmul(a, b)
 
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-1)
+
+
+@pytest.mark.skipif(not is_hip_cdna(), reason="Requires HIP CDNA")
+def test_math_fast_expf():
+    @gluon.jit
+    def fast_expf_kernel(x_ptr, y_ptr, N: ttgl.constexpr):
+        blocked: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+
+        offs = ttgl.arange(0, N, layout=blocked)
+        x = ttgl.load(x_ptr + offs)
+        y = libdevice.fast_expf(x)
+        ttgl.store(y_ptr + offs, y)
+
+    N = 256
+
+    torch.manual_seed(0)
+    x = torch.randn(N, device="cuda", dtype=torch.float32)
+    y = torch.empty_like(x)
+    fast_expf_kernel[(1,)](x, y, N)
+    torch.testing.assert_close(y, torch.exp(x), atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.skipif(not is_hip_cdna(), reason="Requires HIP CDNA")
+def test_math_fast_dividef():
+    @gluon.jit
+    def fast_dividef_kernel(x_ptr, y_ptr, z_ptr, N: ttgl.constexpr):
+        blocked: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+
+        offs = ttgl.arange(0, N, layout=blocked)
+        x = ttgl.load(x_ptr + offs)
+        y = ttgl.load(y_ptr + offs)
+        z = libdevice.fast_dividef(x, y)
+        ttgl.store(z_ptr + offs, z)
+
+    N = 256
+
+    torch.manual_seed(0)
+    x = torch.randn(N, device="cuda", dtype=torch.float32)
+    y = torch.randn(N, device="cuda", dtype=torch.float32)
+    z = torch.empty_like(x)
+    y[y == 0] = 1.0
+    fast_dividef_kernel[(1,)](x, y, z, N)
+    torch.testing.assert_close(z, torch.div(x, y), atol=1e-5, rtol=1e-4)
