@@ -182,6 +182,45 @@ def test_amd_async_copy_global_to_shared():
 
 
 @pytest.mark.skipif(not (is_hip_cdna3() or is_hip_cdna4()), reason="Requires CDNA")
+def test_amd_async_copy_global_to_shared_pipeline():
+
+    @gluon.jit
+    def kernel(a_ptr, b_ptr, N: ttgl.constexpr):
+        blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [32, 2], [4, 1], [1, 0])
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+        stride: ttgl.constexpr = 128 * 16
+
+        smem = ttgl.allocate_shared_memory(a_ptr.dtype.element_ty, [3, 128, 16], shared)
+        offsets = ttgl.arange(0, 128, layout=ttgl.SliceLayout(1, blocked))[:, None] * 16 + \
+                  ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, blocked))[None, :]
+
+        ttgl.amd.cdna3.async_copy_global_to_shared(smem.index(0), a_ptr + offsets)
+
+        for i in range(N-1):
+            ttgl.amd.cdna3.async_copy_global_to_shared(smem.index((i+1) % 2), a_ptr + offsets + stride)
+
+            ttgl.amd.cdna3.async_wait(1)
+            a = smem.index(i % 2).load(blocked)
+            ttgl.amd.cdna3.synced_via_wait(a)
+            ttgl.store(b_ptr + offsets, a)
+
+            offsets += stride
+
+        ttgl.amd.cdna3.async_wait(0)
+        a = smem.index((N - 1) % 2).load(blocked)
+        ttgl.amd.cdna3.synced_via_wait(a)
+        ttgl.store(b_ptr + offsets, a)
+
+    N = 16
+    torch.manual_seed(0)
+    a = torch.randn((128 * N, 16), dtype=torch.float16, device='cuda')
+    b = torch.empty_like(a)
+    kernel[(1, )](a, b, N)
+
+    torch.testing.assert_close(a, b)
+
+
+@pytest.mark.skipif(not (is_hip_cdna3() or is_hip_cdna4()), reason="Requires CDNA")
 def test_amd_buffer_load_to_shared():
 
     @gluon.jit
