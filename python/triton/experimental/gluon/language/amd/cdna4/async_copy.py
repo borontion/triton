@@ -99,9 +99,12 @@ def buffer_load_to_shared(dest, ptr, offsets, mask=None, other=None, cache_modif
 
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:
+        mask = _semantic.to_tensor(mask)
         offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
     other = _unwrap_if_constexpr(other)
     if other is not None:
+        other = _semantic.to_tensor(other)
+        other = _semantic.cast(other, ptr.type.scalar.element_ty)
         offsets, other = _semantic.broadcast_impl_value(offsets, other)
 
     mask = mask.handle if mask is not None else ir.value()
